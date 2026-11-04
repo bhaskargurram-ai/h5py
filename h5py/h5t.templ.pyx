@@ -1298,6 +1298,7 @@ cdef class TypeCompoundID(TypeCompositeID):
         field_types = []
         field_offsets = []
         nfields = self.get_nmembers()
+        widened = False
 
         # First step: read field names and their Numpy dtypes into
         # two separate arrays.
@@ -1307,6 +1308,12 @@ cdef class TypeCompoundID(TypeCompositeID):
             field_names.append(name)
             field_types.append(tmp_type.py_dtype())
             field_offsets.append(self.get_member_offset(i))
+            # A member may map to a larger NumPy type than it occupies in
+            # the file, e.g. a 2-byte custom float (bfloat16) is read as
+            # float32.  The HDF5 offsets and size then no longer describe
+            # the NumPy record.
+            if field_types[-1].itemsize > tmp_type.get_size():
+                widened = True
 
 
         # 1. Check if it should be converted to a complex number
@@ -1324,10 +1331,17 @@ cdef class TypeCompoundID(TypeCompositeID):
         # 2. Otherwise, read all fields of the compound type, in HDF5 order.
         else:
             field_names = [x.decode('utf8') for x in field_names]
-            typeobj = np.dtype({'names': field_names,
-                                'formats': field_types,
-                                'offsets': field_offsets,
-                                'itemsize': self.get_size()})
+            if widened:
+                # Lay the fields out packed, in HDF5 order; the HDF5
+                # conversion matches compound members by name and widens
+                # each one, so the file offsets are not needed in memory.
+                typeobj = np.dtype({'names': field_names,
+                                    'formats': field_types})
+            else:
+                typeobj = np.dtype({'names': field_names,
+                                    'formats': field_types,
+                                    'offsets': field_offsets,
+                                    'itemsize': self.get_size()})
 
         return typeobj
 

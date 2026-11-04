@@ -56,6 +56,109 @@ class TestCompound(ut.TestCase):
         self.assertEqual(tid.dtype.itemsize, size)
 
 
+def _bfloat16_type():
+    """2-byte custom float (bfloat16): sign bit 15, 8 exponent bits at 7,
+    7 mantissa bits at 0, bias 127."""
+    tid = h5t.IEEE_F32LE.copy()
+    tid.set_fields(15, 7, 8, 0, 7)
+    tid.set_size(2)
+    tid.set_ebias(127)
+    tid.lock()
+    return tid
+
+
+# bfloat16 bit patterns of pi, 1/3 and 1, and their values as float32
+BF16_BITS = np.array([0x4049, 0x3eab, 0x3f80], dtype='<u2')
+BF16_VALUES = np.array([3.140625, 0.333984375, 1.0], dtype='<f4')
+
+
+class TestCompoundCustomFloat(TestCase):
+
+    """
+        Feature: Compound members of a custom float type that is read as a
+        larger NumPy type (issue 1825)
+    """
+
+    def make_file(self, name, comp, raw):
+        """Write a chunked dataset of compound type comp from the raw
+        bytes in the structured array raw, using the low-level API."""
+        fname = self.mktemp().encode()
+        fid = h5py.h5f.create(fname)
+        space = h5py.h5s.create_simple((len(raw),))
+        dcpl = h5py.h5p.create(h5py.h5p.DATASET_CREATE)
+        dcpl.set_chunk((1,))
+        dset = h5py.h5d.create(fid, name, comp, space, dcpl)
+        dset.write(h5py.h5s.ALL, h5py.h5s.ALL, raw, comp)
+        del dset, space, dcpl, fid
+        return fname.decode()
+
+    def test_single_member(self):
+        """ The issue's layout: one array member of bfloat16 """
+        bf16 = _bfloat16_type()
+        comp = h5t.create(h5t.COMPOUND, 2)
+        comp.insert(b'values', 0, h5t.array_create(bf16, (1,)))
+        raw = BF16_BITS.view([('values', '<u2', (1,))])
+        fname = self.make_file(b'x', comp, raw)
+
+        with h5py.File(fname, 'r') as f:
+            dset = f['x']
+            self.assertEqual(dset.dtype, np.dtype([('values', '<f4', (1,))]))
+            np.testing.assert_array_equal(dset[:]['values'][:, 0], BF16_VALUES)
+            np.testing.assert_array_equal(dset['values'][:, 0], BF16_VALUES)
+            np.testing.assert_array_equal(
+                dset.fields('values')[:][:, 0], BF16_VALUES)
+
+    def test_mixed_members(self):
+        """ A widened member alongside members that keep their size """
+        bf16 = _bfloat16_type()
+        comp = h5t.create(h5t.COMPOUND, 8)
+        comp.insert(b'tag', 0, h5t.STD_U16LE)
+        comp.insert(b'values', 2, bf16)
+        comp.insert(b'half', 4, h5t.IEEE_F16LE)
+        comp.insert(b'count', 6, h5t.STD_I16LE)
+        raw = np.zeros(3, dtype=[('tag', '<u2'), ('values', '<u2'),
+                                 ('half', '<f2'), ('count', '<i2')])
+        raw['tag'] = [10, 20, 30]
+        raw['values'] = BF16_BITS
+        raw['half'] = [0.5, -1.5, 2.0]
+        raw['count'] = [-1, 0, 7]
+        fname = self.make_file(b'x', comp, raw)
+
+        with h5py.File(fname, 'r+') as f:
+            dset = f['x']
+            self.assertEqual(
+                dset.dtype,
+                np.dtype([('tag', '<u2'), ('values', '<f4'),
+                          ('half', '<f2'), ('count', '<i2')]))
+            data = dset[:]
+            np.testing.assert_array_equal(data['tag'], raw['tag'])
+            np.testing.assert_array_equal(data['values'], BF16_VALUES)
+            np.testing.assert_array_equal(data['half'], raw['half'])
+            np.testing.assert_array_equal(data['count'], raw['count'])
+            np.testing.assert_array_equal(dset['values'], BF16_VALUES)
+            np.testing.assert_array_equal(dset[1], data[1])
+
+            # writing goes back through the same conversion
+            data['values'] = [1.0, -2.0, 0.5]
+            data['count'] = [1, 2, 3]
+            dset[:] = data
+            np.testing.assert_array_equal(dset['values'], [1.0, -2.0, 0.5])
+            np.testing.assert_array_equal(dset['count'], [1, 2, 3])
+            np.testing.assert_array_equal(dset['half'], raw['half'])
+
+    def test_standard_members_keep_offsets(self):
+        """ Compounds without a widened member keep the HDF5 layout """
+        comp = h5t.create(h5t.COMPOUND, 12)
+        comp.insert(b'half', 0, h5t.IEEE_F16LE)
+        comp.insert(b'tag', 4, h5t.STD_U16LE)
+        comp.insert(b'single', 8, h5t.IEEE_F32LE)
+        expected = np.dtype({'names': ['half', 'tag', 'single'],
+                             'formats': ['<f2', '<u2', '<f4'],
+                             'offsets': [0, 4, 8], 'itemsize': 12})
+        self.assertEqual(comp.dtype, expected)
+        self.assertEqual(comp.dtype.itemsize, comp.get_size())
+
+
 class TestTypeFloatID(TestCase):
     """Test TypeFloatID."""
 
